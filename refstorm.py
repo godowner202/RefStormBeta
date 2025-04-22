@@ -402,8 +402,6 @@ class LicenseSystem:
         # Start the thread
         threading.Thread(target=check_thread, daemon=True).start()
 
-
-
 # Try to import selenium components, with fallback message
 try:
     from selenium import webdriver
@@ -574,8 +572,110 @@ class RefStormApp:
         # Check for saved license
         if self.check_saved_license():
             self.status_text.set("Licensed")
+            # Start the periodic license check
+            self.initialize_license_system()
         else:
             self.status_text.set("Unlicensed - Please activate")
+
+    def update_license_status(self, is_valid, message):
+        """Update the license status display based on validation result"""
+        if is_valid:
+            self.license_status_var.set("✅ Licensed")
+            self.display_license_info()
+            self.add_log("License validated successfully")
+        else:
+            self.license_status_var.set("⚠️ Unlicensed")
+            self.add_log(f"License validation failed: {message}")
+            
+    def initialize_license_system(self):
+        """Initialize the license system and start periodic checks"""
+        # Start periodic check with a callback
+        self.license_system.start_stronger_periodic_check(
+            callback=self.handle_license_revocation,
+            check_interval=300  # Check every 5 minutes
+        )
+        self.add_log("Started periodic license validation")
+    
+    def handle_license_revocation(self, message):
+        """Handle license revocation or expiration during runtime"""
+        # This runs in a background thread, so we need to use after() to update the UI
+        self.root.after(0, lambda: self.show_license_revoked_dialog(message))
+    
+    def show_license_revoked_dialog(self, message):
+        """Show a dialog indicating the license has been revoked and force the user to re-license"""
+        messagebox.showerror("License Revoked", 
+                           f"Your license is no longer valid: {message}\n\n"
+                           f"The application will now close.")
+    
+        # Disable all functionality
+        self.disable_all_features()
+    
+        # Force the user to close and restart the application
+        self.root.quit()
+    
+    def disable_all_features(self):
+        """Disable all interactive features of the application"""
+        # Disable all buttons and inputs
+        for widget in self.root.winfo_children():
+            if isinstance(widget, (Button, Entry, Checkbutton)):
+                widget.config(state="disabled")
+        
+        # Set status to indicate disabled state
+        self.status_text.set("License revoked - Application disabled")
+        self.license_status_var.set("❌ License Revoked")
+    
+    def activate_license(self):
+        license_key = self.license_key_var.get().strip()
+    
+        if not license_key:
+            messagebox.showerror("License Error", "Please enter a license key.")
+            return
+    
+        # Validate license format
+        if not self.license_system.validate_license_format(license_key):
+            messagebox.showerror("License Error", "Invalid license key format. Please enter a valid license key.")
+            return
+    
+        self.status_text.set("Activating license...")
+    
+        # Run activation in a separate thread
+        def activation_thread():
+            is_valid, message = self.license_system.activate_license(license_key)
+        
+            if is_valid:
+                # Update UI
+                self.root.after(0, lambda: self.license_status_var.set("✅ Licensed"))
+                self.root.after(0, lambda: self.display_license_info())
+                self.root.after(0, lambda: messagebox.showinfo("License Activated", "License successfully activated!"))
+                self.root.after(0, lambda: self.add_log("License successfully activated"))
+                self.root.after(0, lambda: self.status_text.set("Licensed"))
+                # Start periodic check
+                self.root.after(0, self.initialize_license_system)
+            else:
+                self.root.after(0, lambda: messagebox.showerror("License Error", message))
+                self.root.after(0, lambda: self.add_log(f"License activation failed: {message}"))
+                self.root.after(0, lambda: self.status_text.set("Unlicensed"))
+    
+        threading.Thread(target=activation_thread).start()
+
+    def check_saved_license(self):
+        """Check if there's a saved license and validate it"""
+        license_key = self.license_system.load_license_from_config()
+    
+        if not license_key:
+            return False
+    
+        is_valid, message = self.license_system.check_license(license_key)
+    
+        if is_valid:
+            self.license_status_var.set("✅ Licensed")
+            self.license_system.is_licensed = True
+            self.display_license_info()
+            self.add_log("License validated successfully")
+            return True
+        else:
+            self.add_log(f"Saved license validation failed: {message}")
+            return False
         
     def create_header(self):
         header_frame = Frame(self.container)
