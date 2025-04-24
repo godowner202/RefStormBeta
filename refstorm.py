@@ -48,32 +48,6 @@ class UserLicenseSystem:
         self.cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".license_cache")
         os.makedirs(self.cache_dir, exist_ok=True)
         
-        # Install directory identifier (persistent across installations)
-        self.install_id = self.get_or_create_install_id()
-        
-    def get_or_create_install_id(self):
-        """Get existing installation ID or create a new one"""
-        install_file = os.path.join(self.cache_dir, "install_id.json")
-        
-        if os.path.exists(install_file):
-            try:
-                with open(install_file, "r") as f:
-                    data = json.load(f)
-                    return data.get("install_id", str(uuid.uuid4()))
-            except:
-                pass
-        
-        # Create new install ID
-        install_id = str(uuid.uuid4())
-        
-        try:
-            with open(install_file, "w") as f:
-                json.dump({"install_id": install_id, "created_at": datetime.now(timezone.utc).isoformat()}, f, indent=4)
-        except:
-            pass
-            
-        return install_id
-        
     def check_license(self, license_key):
         """Verify if the license is valid"""
         if not license_key:
@@ -158,23 +132,6 @@ class UserLicenseSystem:
             self.supabase.table('sessions').delete().eq('license_key', license_key).lt('last_active', one_hour_ago).execute()
         except:
             pass
-            
-        # Count active sessions
-        try:
-            response = self.supabase.table('sessions').select('*').eq('license_key', license_key).execute()
-            active_sessions = len(response.data) if response.data else 0
-            
-            device_name = socket.gethostname()
-            
-            # Check if this device already has an active session
-            for session in response.data:
-                if session.get('device_name') == device_name and session.get('install_id') == self.install_id:
-                    # Update existing session
-                    self.current_session_id = session.get('session_id')
-                    self.supabase.table('sessions').update({
-                        'last_active': datetime.now(timezone.utc).isoformat()
-                    }).eq('session_id', self.current_session_id).execute()
-                    return True, "Session updated"
 
 # Try to import selenium components, with fallback message
 try:
