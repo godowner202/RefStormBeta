@@ -14,7 +14,6 @@ import json
 import re
 import requests
 from datetime import datetime, timedelta
-# === License System with Supabase ===
 import os
 import uuid
 import socket
@@ -26,7 +25,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from supabase import create_client, Client
 
-class LicenseSystem:
+class UserLicenseSystem:
     def __init__(self):
         # Supabase credentials
         self.supabase_url = "https://xifdmmpexgiodpzvgifl.supabase.co"
@@ -39,38 +38,42 @@ class LicenseSystem:
         except Exception as e:
             print(f"Failed to initialize Supabase: {str(e)}")
             self.online_db_available = False
-            
-        self.hardware_id = self.get_hardware_id()
+        
+        # Initialize license state
         self.is_licensed = False
         self.license_info = {}
+        self.current_session_id = None
         
         # Initialize cache directory
         self.cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".license_cache")
         os.makedirs(self.cache_dir, exist_ok=True)
         
-    def get_hardware_id(self):
-        """Generate a unique hardware ID based on machine details"""
-        mac = uuid.getnode()
-        hostname = socket.gethostname()
-        cpu_id = self.get_cpu_id()
+        # Install directory identifier (persistent across installations)
+        self.install_id = self.get_or_create_install_id()
         
-        # Combine hardware details and hash them
-        combined = f"{mac}-{hostname}-{cpu_id}"
-        return hashlib.sha256(combined.encode()).hexdigest()
-    
-    def get_cpu_id(self):
-        """Get CPU ID (simplified version)"""
-        if os.name == 'nt':  # Windows
+    def get_or_create_install_id(self):
+        """Get existing installation ID or create a new one"""
+        install_file = os.path.join(self.cache_dir, "install_id.json")
+        
+        if os.path.exists(install_file):
             try:
-                import wmi
-                c = wmi.WMI()
-                for processor in c.Win32_Processor():
-                    return processor.ProcessorId.strip()
+                with open(install_file, "r") as f:
+                    data = json.load(f)
+                    return data.get("install_id", str(uuid.uuid4()))
             except:
                 pass
-        # Fallback to a portion of the uuid based on host ID
-        return str(uuid.uuid1())[:8]
-    
+        
+        # Create new install ID
+        install_id = str(uuid.uuid4())
+        
+        try:
+            with open(install_file, "w") as f:
+                json.dump({"install_id": install_id, "created_at": datetime.now(timezone.utc).isoformat()}, f, indent=4)
+        except:
+            pass
+            
+        return install_id
+        
     def check_license(self, license_key):
         """Verify if the license is valid"""
         if not license_key:
@@ -79,8 +82,8 @@ class LicenseSystem:
         # Try online validation first
         if self.online_db_available:
             try:
-                result, message, success = self.online_validation(license_key)
-                if success:
+                result, message = self.online_validation(license_key)
+                if result:
                     return result, message
             except Exception as e:
                 print(f"Online validation error: {str(e)}")
@@ -92,7 +95,7 @@ class LicenseSystem:
     def online_validation(self, license_key):
         """Perform online validation with Supabase database"""
         if not license_key:
-            return False, "No license key provided", True
+            return False, "No license key provided"
         
         try:
             # Fetch the license from Supabase
@@ -100,13 +103,13 @@ class LicenseSystem:
             
             # Check if license exists
             if not response.data:
-                return False, "Invalid license key", True
+                return False, "Invalid license key"
                 
             license_data = response.data[0]
             
             # Check if license is still active
             if not license_data.get('is_active', False):
-                return False, "License has been revoked", True
+                return False, "License has been revoked"
                 
             # Check if license has expired
             expires_at = license_data.get('expires_at')
@@ -116,291 +119,62 @@ class LicenseSystem:
                     exp_date = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
                     now = datetime.now(timezone.utc)
                     if now > exp_date:
-                        return False, "License has expired", True
+                        return False, "License has expired"
                 except Exception as e:
                     print(f"Date parsing error: {str(e)}")
             
-            # Check hardware binding if it exists
-            hardware_id = license_data.get('hardware_id')
-            if hardware_id and hardware_id != self.hardware_id:
-                # License is bound to a different machine
-                activation_count = license_data.get('activation_count', 0)
-                max_activations = license_data.get('max_activations', 1) 
-                if activation_count >= max_activations:
-                    return False, "License already activated on another machine", True
+            # Check session count
+            max_sessions = license_data.get('max_sessions', 1) 
             
-            # Update license with hardware ID if not set and log activation
-            try:
-                if not hardware_id:
-                    self.supabase.table('licenses').update({
-                        'hardware_id': self.hardware_id, 
-                        'activation_count': 1,
-                        'last_checked': datetime.now(timezone.utc).isoformat()
-                    }).eq('license_key', license_key).execute()
-                else:
-                    # Increment activation count if on different hardware
-                    if hardware_id != self.hardware_id:
-                        self.supabase.table('licenses').update({
-                            'activation_count': activation_count + 1,
-                            'last_checked': datetime.now(timezone.utc).isoformat()
-                        }).eq('license_key', license_key).execute()
-                    else:
-                        # Just update last checked time
-                        self.supabase.table('licenses').update({
-                            'last_checked': datetime.now(timezone.utc).isoformat()
-                        }).eq('license_key', license_key).execute()
-                
-                # Log this activation
-                self.supabase.table('activations').insert({
-                    'license_key': license_key,
-                    'hardware_id': self.hardware_id,
-                    'activation_time': datetime.now(timezone.utc).isoformat()
-                }).execute()
-            except Exception as e:
-                print(f"Error updating license: {str(e)}")
+            # Check if we can start a new session
+            session_result, session_message = self.check_and_register_session(license_key, max_sessions)
+            if not session_result:
+                return False, session_message
             
             # Save license info for future reference
             self.license_info = {
                 'key': license_data.get('license_key'),
                 'name': license_data.get('name'),
                 'email': license_data.get('email'),
-                'expires_at': license_data.get('expires_at')
+                'expires_at': license_data.get('expires_at'),
+                'max_sessions': max_sessions
             }
             
             # Cache the license locally for offline usage
             self.cache_license(license_key, license_data)
             
             self.is_licensed = True
-            return True, "License validated successfully", True
+            return True, "License validated successfully"
             
         except Exception as e:
-            # Return false but indicate the online check failed so we can try offline
-            return False, f"Online validation failed: {str(e)}", False
+            # Return false and try offline
+            return False, f"Online validation failed: {str(e)}"
     
-    def offline_validation(self, license_key):
-        """Validate license using cached data when offline"""
-        if not license_key:
-            return False, "No license key provided"
-            
-        cached_license = self.get_cached_license(license_key)
-        if not cached_license:
-            return False, "License not found in cache"
-        
-        # Check if license is active in cache
-        if not cached_license.get('is_active', False):
-            return False, "Cached license has been revoked"
-            
-        # Check expiration
-        expires_at = cached_license.get('expires_at')
-        if expires_at:
-            try:
-                # Parse with timezone awareness
-                exp_date = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-                now = datetime.now(timezone.utc)
-                if now > exp_date:
-                    return False, "Cached license has expired"
-            except Exception as e:
-                print(f"Cache date parsing error: {str(e)}")
-        
-        # Check hardware binding
-        hw_id = cached_license.get('hardware_id')
-        if hw_id and hw_id != self.hardware_id:
-            return False, "License is bound to another machine"
-        
-        # Set the license info from cache
-        self.license_info = {
-            'key': cached_license.get('license_key'),
-            'name': cached_license.get('name'),
-            'email': cached_license.get('email'),
-            'expires_at': cached_license.get('expires_at')
-        }
-        
-        self.is_licensed = True
-        return True, "License validated from cache"
-    
-    def cache_license(self, license_key, license_data):
-        """Save license data to local cache"""
-        if not license_key or not license_data:
-            return
-            
-        cache_file = os.path.join(self.cache_dir, hashlib.md5(license_key.encode()).hexdigest() + ".json")
-        
+    def check_and_register_session(self, license_key, max_sessions=1):
+        """Check session limits and register a new session"""
+        # First clean up inactive sessions (inactive for more than 1 hour)
         try:
-            with open(cache_file, "w") as f:
-                # Create a cleaned version of the license data for caching
-                cache_data = {
-                    'license_key': license_data.get('license_key'),
-                    'hardware_id': license_data.get('hardware_id'),
-                    'name': license_data.get('name'),
-                    'email': license_data.get('email'),
-                    'expires_at': license_data.get('expires_at'),
-                    'is_active': license_data.get('is_active', True),
-                    'cached_at': datetime.now(timezone.utc).isoformat(),
-                    'max_activations': license_data.get('max_activations', 1)
-                }
-                json.dump(cache_data, f, indent=4)
-        except Exception as e:
-            print(f"Failed to cache license: {str(e)}")
-    
-    def get_cached_license(self, license_key):
-        """Get license data from local cache"""
-        if not license_key:
-            return None
-            
-        cache_file = os.path.join(self.cache_dir, hashlib.md5(license_key.encode()).hexdigest() + ".json")
-        
-        if not os.path.exists(cache_file):
-            return None
-            
-        try:
-            with open(cache_file, "r") as f:
-                return json.load(f)
+            one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+            self.supabase.table('sessions').delete().eq('license_key', license_key).lt('last_active', one_hour_ago).execute()
         except:
-            return None
-    
-    def save_license_to_config(self, license_key):
-        """Save the license key to config file"""
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "license_config.json")
-        
-        # Simple encryption of the license key
-        encoded_key = base64.b64encode(license_key.encode()).decode()
-        
-        config = {
-            "license": encoded_key,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=4)
-    
-    def load_license_from_config(self):
-        """Load license key from config if available"""
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "license_config.json")
-        
-        if not os.path.exists(config_path):
-            return None
+            pass
             
+        # Count active sessions
         try:
-            with open(config_path, "r") as f:
-                config = json.load(f)
-                
-            encoded_key = config.get("license", "")
-            license_key = base64.b64decode(encoded_key).decode()
-            return license_key
-        except:
-            return None
-    
-    def activate_license(self, license_key):
-        """Activate the license and save it"""
-        is_valid, message = self.check_license(license_key)
-        
-        if is_valid:
-            self.is_licensed = True
-            self.save_license_to_config(license_key)
-        
-        return is_valid, message
-    
-    def validate_license_format(self, license_key):
-        """Check if the license key format is valid"""
-        # License format: XXXX-XXXX-XXXX-XXXX or XXXXXXXXXXXXXXXX
-        license_key = license_key.strip()
-        
-        # Remove any hyphens
-        clean_key = license_key.replace("-", "")
-        
-        # Check if it's 16 characters and alphanumeric
-        if len(clean_key) != 16 or not clean_key.isalnum():
-            return False
+            response = self.supabase.table('sessions').select('*').eq('license_key', license_key).execute()
+            active_sessions = len(response.data) if response.data else 0
             
-        return True
-    
-    def start_stronger_periodic_check(self, callback=None, check_interval=300):
-        """
-        Start a more frequent periodic license check in the background
-    
-        Args:
-            callback: Function to call when license becomes invalid
-            check_interval: Time in seconds between checks (default 5 minutes)
-        """
-        def check_thread():
-            while True:
-                # Sleep for the specified interval
-                time.sleep(check_interval)
+            device_name = socket.gethostname()
             
-                # Only check if we're licensed
-                if not self.is_licensed:
-                        continue
-                
-                # Get current license key
-                license_key = self.license_info.get('key')
-                if not license_key:
-                    continue
-                
-                print(f"[LICENSE] Performing periodic license validation check")
-            
-                # Always try online validation first
-                try:
-                    # Do a fresh check directly against the database
-                    response = self.supabase.table('licenses').select('*').eq('license_key', license_key).execute()
-                
-                    if not response.data:
-                        # License has been completely removed
-                        self.is_licensed = False
-                        print("[LICENSE] License no longer exists in database")
-                        if callback:
-                            callback("License has been revoked")
-                        continue
-                    
-                    license_data = response.data[0]
-                
-                    # Check if license is still active
-                    if not license_data.get('is_active', False):
-                        self.is_licensed = False
-                        print("[LICENSE] License has been revoked")
-                    
-                        # Also update the cache to reflect the revoked status
-                        cached_license = self.get_cached_license(license_key)
-                        if cached_license:
-                            cached_license['is_active'] = False
-                            self.cache_license(license_key, cached_license)
-                    
-                        if callback:
-                            callback("License has been revoked")
-                        continue
-                
-                    # Check if license has expired
-                    expires_at = license_data.get('expires_at')
-                    if expires_at:
-                        try:
-                            exp_date = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-                            now = datetime.now(timezone.utc)
-                            if now > exp_date:
-                                self.is_licensed = False
-                                print("[LICENSE] License has expired")
-                                if callback:
-                                    callback("License has expired")
-                                continue
-                        except Exception as e:
-                            print(f"[LICENSE] Error parsing date: {str(e)}")
-                
-                    # License is still valid, update last checked time
-                    try:
-                        self.supabase.table('licenses').update({
-                            'last_checked': datetime.now(timezone.utc).isoformat()
-                        }).eq('license_key', license_key).execute()
-                    
-                        # Update the cached license data
-                        self.cache_license(license_key, license_data)
-                    except Exception as e:
-                        print(f"[LICENSE] Error updating last check: {str(e)}")
-                
-                except Exception as e:
-                    print(f"[LICENSE] Periodic check error: {str(e)}")
-                    # If we can't reach the server, we'll just continue using the current license status
-                    # Don't change self.is_licensed here as we don't know if the license is truly invalid
-    
-        # Start the thread
-        threading.Thread(target=check_thread, daemon=True).start()
+            # Check if this device already has an active session
+            for session in response.data:
+                if session.get('device_name') == device_name and session.get('install_id') == self.install_id:
+                    # Update existing session
+                    self.current_session_id = session.get('session_id')
+                    self.supabase.table('sessions').update({
+                        'last_active': datetime.now(timezone.utc).isoformat()
+                    }).eq('session_id', self.current_session_id).execute()
+                    return True, "Session updated"
 
 # Try to import selenium components, with fallback message
 try:
@@ -1048,7 +822,7 @@ class RefStormApp:
     
         info_text = """
     • A valid license key is required to use RefStorm
-    • License is bound to your hardware after activation
+    • License is bound to your User Account after activation
     • Contact support if you need to transfer your license
     • Your license includes free updates for the duration of your subscription
         """
